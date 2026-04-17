@@ -1,0 +1,10 @@
+{
+    "java.jdt.ls.java.home": "c:\\DEV\\HTKY\\oracleJdk-26",
+    "java.configuration.runtimes": [
+        {
+            "name": "JavaSE-26",
+            "path": "c:\\DEV\\HTKY\\oracleJdk-26",
+            "default": true
+        }
+    ]
+}

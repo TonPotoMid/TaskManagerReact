@@ -1,0 +1,20 @@
+{
+    "version": "0.2.0",
+    "configurations": [
+        {
+            "type": "java",
+            "name": "Déboguer Main.java",
+            "request": "launch",
+            "mainClass": "Main",
+            "classPaths": [
+                "${workspaceFolder}/JavaTaskManager",
+                "${workspaceFolder}/JavaTaskManager/lib/postgresql-42.7.5.jar"
+            ],
+            "sourcePaths": [
+                "${workspaceFolder}/JavaTaskManager"
+            ],
+            "cwd": "${workspaceFolder}/JavaTaskManager",
+            "console": "integratedTerminal"
+        }
+    ]
+}

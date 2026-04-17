@@ -1,0 +1,17 @@
+oracleJdk-26/
+
+# Java / IntelliJ
+*.iml
+.idea/
+**/out/
+**/build/
+*.class
+
+# Node / frontend
+**/node_modules/
+**/dist/
+
+# Logs and env
+*.log
+.env
+.DS_Store

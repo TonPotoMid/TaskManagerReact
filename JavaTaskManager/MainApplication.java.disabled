@@ -1,0 +1,760 @@
+import java.util.ArrayList;
+import java.util.List;
+import java.util.Scanner;
+import java.time.LocalDate;
+import java.time.format.DateTimeParseException;
+import java.sql.Connection;
+import java.sql.Date;
+import java.sql.DriverManager;
+import java.sql.PreparedStatement;
+import java.sql.ResultSet;
+import java.sql.SQLException;
+
+interface Completable {
+    void markCompleted();
+    boolean isCompleted();
+}
+
+interface HasDeadline {
+    LocalDate getDeadline();
+}
+
+abstract class Task implements Completable {
+    private int id;
+    protected String title;
+    protected String description;
+    protected boolean completed;
+    protected Priority priority;
+    protected String subjectName;
+
+    public enum Priority {
+        LOW, MEDIUM, HIGH, CRITICAL
+    }
+
+    public Task(String title, String description, Priority priority, String subjectName) {
+        this(0, title, description, priority, false, subjectName);
+    }
+
+    protected Task(int id, String title, String description, Priority priority, boolean completed, String subjectName) {
+        this.id = id;
+        this.title = title;
+        this.description = description;
+        this.priority = priority;
+        this.completed = completed;
+        this.subjectName = normalizeSubjectName(subjectName);
+    }
+
+    public int getId() {
+        return id;
+    }
+
+    public void setId(int id) {
+        this.id = id;
+    }
+
+    public String getTitle() {
+        return title;
+    }
+
+    public String getDescription() {
+        return description;
+    }
+
+    public Priority getPriority() {
+        return priority;
+    }
+
+    public String getSubjectName() {
+        return subjectName;
+    }
+
+    @Override
+    public void markCompleted() {
+        completed = true;
+    }
+
+    @Override
+    public boolean isCompleted() {
+        return completed;
+    }
+
+    public abstract String getType();
+
+    @Override
+    public String toString() {
+        String subjectPart = subjectName == null ? "" : " [" + subjectName + "] ";
+
+        return "#" + id + " [" + getType() + "] [" + priority + "]" + subjectPart +
+                (completed ? "[Oui] " : "[Non] ") +
+                title + " - " + description;
+    }
+
+    private String normalizeSubjectName(String rawSubjectName) {
+        if (rawSubjectName == null) {
+            return null;
+        }
+
+        String trimmed = rawSubjectName.trim();
+        return trimmed.isEmpty() ? null : trimmed;
+    }
+}
+
+class SimpleTask extends Task {
+    public SimpleTask(String title, String description, Priority priority, String subjectName) {
+        super(title, description, priority, subjectName);
+    }
+
+    public SimpleTask(int id, String title, String description, Priority priority, boolean completed, String subjectName) {
+        super(id, title, description, priority, completed, subjectName);
+    }
+
+    @Override
+    public String getType() {
+        return "Simple";
+    }
+}
+
+class DatabaseManager {
+    private static final String DEFAULT_URL = "jdbc:postgresql://localhost:5432/postgres";
+    private static final String DEFAULT_USER = "postgres";
+    private static final String DEFAULT_PASSWORD = "MonNouveauMotDePasse";
+        private static final String CREATE_SUBJECT_TABLE_SQL =
+            "CREATE TABLE IF NOT EXISTS subject (" +
+                "id SERIAL PRIMARY KEY, " +
+                "name VARCHAR(100) NOT NULL UNIQUE" +
+                ")";
+        private static final String CREATE_TASK_TABLE_SQL =
+            "CREATE TABLE IF NOT EXISTS task (" +
+                "id SERIAL PRIMARY KEY, " +
+                "title VARCHAR(150) NOT NULL, " +
+                "description TEXT NOT NULL, " +
+                "priority VARCHAR(20) NOT NULL, " +
+                "state BOOLEAN NOT NULL DEFAULT FALSE, " +
+                "deadline DATE, " +
+                "subject_id INTEGER REFERENCES subject(id)" +
+                ")";
+
+    public void initialize() throws SQLException {
+        try (Connection connection = openConnection();
+             PreparedStatement subjectStatement = connection.prepareStatement(CREATE_SUBJECT_TABLE_SQL);
+             PreparedStatement taskStatement = connection.prepareStatement(CREATE_TASK_TABLE_SQL)) {
+            subjectStatement.execute();
+            taskStatement.execute();
+        }
+    }
+
+    public List<Task> loadTasks() throws SQLException {
+        List<Task> tasks = new ArrayList<>();
+        String sql = "SELECT t.id, t.title, t.description, t.priority, t.state, t.deadline, " +
+            "s.name AS subject_name FROM task t " +
+            "LEFT JOIN subject s ON s.id = t.subject_id " +
+            "ORDER BY t.id";
+
+        try (Connection connection = openConnection();
+             PreparedStatement statement = connection.prepareStatement(sql);
+             ResultSet resultSet = statement.executeQuery()) {
+            while (resultSet.next()) {
+                int id = resultSet.getInt("id");
+                String title = resultSet.getString("title");
+                String description = resultSet.getString("description");
+                Task.Priority priority = Task.Priority.valueOf(resultSet.getString("priority"));
+                boolean completed = resultSet.getBoolean("state");
+                Date deadlineValue = resultSet.getDate("deadline");
+                String subjectName = resultSet.getString("subject_name");
+
+                if (deadlineValue != null) {
+                    tasks.add(new DeadlineTask(id, title, description, priority, completed, deadlineValue.toLocalDate(), subjectName));
+                } else {
+                    tasks.add(new SimpleTask(id, title, description, priority, completed, subjectName));
+                }
+            }
+        }
+
+        return tasks;
+    }
+
+    public void insertTask(Task task) throws SQLException {
+        String sql = "INSERT INTO task (title, description, priority, state, deadline, subject_id) VALUES (?, ?, ?, ?, ?, ?) RETURNING id";
+
+        try (Connection connection = openConnection();
+             PreparedStatement statement = connection.prepareStatement(sql)) {
+            statement.setString(1, task.getTitle());
+            statement.setString(2, task.getDescription());
+            statement.setString(3, task.getPriority().name());
+            statement.setBoolean(4, task.isCompleted());
+
+            if (task instanceof DeadlineTask) {
+                DeadlineTask deadlineTask = (DeadlineTask) task;
+                statement.setDate(5, Date.valueOf(deadlineTask.getDeadline()));
+            } else {
+                statement.setDate(5, null);
+            }
+
+            Integer subjectId = getOrCreateSubjectId(connection, task.getSubjectName());
+            if (subjectId == null) {
+                statement.setObject(6, null);
+            } else {
+                statement.setInt(6, subjectId);
+            }
+
+            try (ResultSet resultSet = statement.executeQuery()) {
+                if (resultSet.next()) {
+                    task.setId(resultSet.getInt("id"));
+                }
+            }
+        }
+    }
+
+    public boolean updateTask(Task task) throws SQLException {
+        String sql = "UPDATE task SET title = ?, description = ?, priority = ?, state = ?, deadline = ?, subject_id = ? WHERE id = ?";
+
+        try (Connection connection = openConnection();
+             PreparedStatement statement = connection.prepareStatement(sql)) {
+            statement.setString(1, task.getTitle());
+            statement.setString(2, task.getDescription());
+            statement.setString(3, task.getPriority().name());
+            statement.setBoolean(4, task.isCompleted());
+
+            if (task instanceof DeadlineTask) {
+                DeadlineTask deadlineTask = (DeadlineTask) task;
+                statement.setDate(5, Date.valueOf(deadlineTask.getDeadline()));
+            } else {
+                statement.setDate(5, null);
+            }
+
+            Integer subjectId = getOrCreateSubjectId(connection, task.getSubjectName());
+            if (subjectId == null) {
+                statement.setObject(6, null);
+            } else {
+                statement.setInt(6, subjectId);
+            }
+
+            statement.setInt(7, task.getId());
+            return statement.executeUpdate() > 0;
+        }
+    }
+
+    public boolean updateTaskCompletion(int id, boolean completed) throws SQLException {
+        String sql = "UPDATE task SET state = ? WHERE id = ?";
+
+        try (Connection connection = openConnection();
+             PreparedStatement statement = connection.prepareStatement(sql)) {
+            statement.setBoolean(1, completed);
+            statement.setInt(2, id);
+            return statement.executeUpdate() > 0;
+        }
+    }
+
+    public boolean deleteTask(int id) throws SQLException {
+        String sql = "DELETE FROM task WHERE id = ?";
+
+        try (Connection connection = openConnection();
+             PreparedStatement statement = connection.prepareStatement(sql)) {
+            statement.setInt(1, id);
+            return statement.executeUpdate() > 0;
+        }
+    }
+
+    public String describeConnection() {
+        return resolveSetting("task.db.url", "TASK_DB_URL", DEFAULT_URL)
+                + " | user="
+                + resolveSetting("task.db.user", "TASK_DB_USER", DEFAULT_USER);
+    }
+
+    private Connection openConnection() throws SQLException {
+        return DriverManager.getConnection(
+                resolveSetting("task.db.url", "TASK_DB_URL", DEFAULT_URL),
+                resolveSetting("task.db.user", "TASK_DB_USER", DEFAULT_USER),
+                resolveSetting("task.db.password", "TASK_DB_PASSWORD", DEFAULT_PASSWORD)
+        );
+    }
+
+    private Integer getOrCreateSubjectId(Connection connection, String subjectName) throws SQLException {
+        if (subjectName == null || subjectName.isBlank()) {
+            return null;
+        }
+
+        String selectSql = "SELECT id FROM subject WHERE name = ?";
+        try (PreparedStatement selectStatement = connection.prepareStatement(selectSql)) {
+            selectStatement.setString(1, subjectName);
+            try (ResultSet resultSet = selectStatement.executeQuery()) {
+                if (resultSet.next()) {
+                    return resultSet.getInt("id");
+                }
+            }
+        }
+
+        String insertSql = "INSERT INTO subject (name) VALUES (?) RETURNING id";
+        try (PreparedStatement insertStatement = connection.prepareStatement(insertSql)) {
+            insertStatement.setString(1, subjectName);
+            try (ResultSet resultSet = insertStatement.executeQuery()) {
+                if (resultSet.next()) {
+                    return resultSet.getInt("id");
+                }
+            }
+        }
+
+        return null;
+    }
+
+    private String resolveSetting(String propertyKey, String envKey, String defaultValue) {
+        String systemValue = System.getProperty(propertyKey);
+        if (systemValue != null && !systemValue.isBlank()) {
+            return systemValue;
+        }
+
+        String envValue = System.getenv(envKey);
+        if (envValue != null && !envValue.isBlank()) {
+            return envValue;
+        }
+
+        return defaultValue;
+    }
+}
+
+class TaskManager {
+    private final List<Task> tasks;
+    private final DatabaseManager databaseManager;
+
+    public TaskManager(DatabaseManager databaseManager) throws SQLException {
+        this.databaseManager = databaseManager;
+        this.tasks = databaseManager.loadTasks();
+    }
+
+    public void addTask(Task task) throws SQLException {
+        databaseManager.insertTask(task);
+        tasks.add(task);
+        System.out.println("Tache ajoutee avec succes (ID: " + task.getId() + ")");
+    }
+
+    public void showTasks() {
+        if (tasks.isEmpty()) {
+            System.out.println("Aucune tache enregistree.");
+        } else {
+            System.out.println("\n========== LISTE DES TACHES ==========");
+            for (Task task : tasks) {
+                printTaskCard(task);
+            }
+            System.out.println("======================================");
+        }
+    }
+
+    private void printTaskCard(Task task) {
+        System.out.println("+--------------------------------------+");
+        System.out.println("| ID       : " + task.getId());
+        System.out.println("| Type     : " + task.getType());
+        System.out.println("| Etat     : " + (task.isCompleted() ? "Terminee" : "En cours"));
+        System.out.println("| Priorite : " + task.getPriority());
+        System.out.println("| Matiere  : " + (task.getSubjectName() == null ? "-" : task.getSubjectName()));
+        System.out.println("| Titre    : " + task.getTitle());
+        System.out.println("| Desc     : " + task.getDescription());
+        if (task instanceof DeadlineTask) {
+            DeadlineTask deadlineTask = (DeadlineTask) task;
+            System.out.println("| Deadline : " + deadlineTask.getDeadline());
+        }
+        System.out.println("+--------------------------------------+");
+    }
+
+    public void completeTaskById(int id) throws SQLException {
+        for (Task task : tasks) {
+            if (task.getId() == id) {
+                if (!databaseManager.updateTaskCompletion(id, true)) {
+                    System.out.println("Tâche non trouvée");
+                    return;
+                }
+                task.markCompleted();
+                System.out.println("Tâche terminée");
+                return;
+            }
+        }
+        System.out.println("Tâche non trouvée");
+    }
+
+    public void removeTaskById(int id) throws SQLException {
+        boolean removed = databaseManager.deleteTask(id);
+        if (removed) {
+            tasks.removeIf(task -> task.getId() == id);
+            System.out.println("Tâche supprimée");
+        } else {
+            System.out.println("Tâche non trouvée");
+        }
+    }
+
+    public Task findTaskById(int id) {
+        for (Task task : tasks) {
+            if (task.getId() == id) {
+                return task;
+            }
+        }
+        return null;
+    }
+
+    public void updateTask(Task updatedTask) throws SQLException {
+        if (!databaseManager.updateTask(updatedTask)) {
+            System.out.println("Tâche non trouvée");
+            return;
+        }
+
+        for (int index = 0; index < tasks.size(); index++) {
+            if (tasks.get(index).getId() == updatedTask.getId()) {
+                tasks.set(index, updatedTask);
+                System.out.println("Tâche modifiée");
+                return;
+            }
+        }
+
+        System.out.println("Tâche non trouvée");
+    }
+}
+
+class DeadlineTask extends Task implements HasDeadline {
+    private LocalDate deadline;
+
+    public DeadlineTask(String title, String description, Priority priority, LocalDate deadline, String subjectName) {
+        super(title, description, priority, subjectName);
+        this.deadline = deadline;
+    }
+
+    public DeadlineTask(int id, String title, String description, Priority priority, boolean completed, LocalDate deadline, String subjectName) {
+        super(id, title, description, priority, completed, subjectName);
+        this.deadline = deadline;
+    }
+
+    @Override
+    public String getType() {
+        return "Deadline";
+    }
+
+    @Override
+    public LocalDate getDeadline() {
+        return deadline;
+    }
+
+    @Override
+    public String toString() {
+        return super.toString() + " (avant " + deadline + ")";
+    }
+}
+
+public class Main {
+    public static void main(String[] args) {
+        System.setOut(new java.io.PrintStream(System.out, true, java.nio.charset.StandardCharsets.UTF_8));
+        Scanner scanner = new Scanner(System.in);
+        DatabaseManager databaseManager = new DatabaseManager();
+        TaskManager manager;
+
+        try {
+            databaseManager.initialize();
+            manager = new TaskManager(databaseManager);
+            System.out.println("Base PostgreSQL connectée: " + databaseManager.describeConnection());
+        } catch (SQLException e) {
+            System.out.println("Impossible de se connecter à PostgreSQL.");
+            System.out.println("Vérifie l'URL, l'utilisateur, le mot de passe et le driver JDBC dans le classpath.");
+            System.out.println("Détail: " + e.getMessage());
+            return;
+        }
+
+        try {
+            controller.TaskController taskController = new controller.TaskController(8080);
+            taskController.start();
+        } catch (java.io.IOException e) {
+            System.out.println("Impossible de démarrer l'API MVC: " + e.getMessage());
+        }
+
+        while (true) {
+            printMainMenu();
+            int choice = readIntInRange(scanner, "Choisis une option (1-6): ", 1, 6);
+
+            switch (choice) {
+                case 1:
+                    handleCreateTask(scanner, manager);
+                    break;
+
+                case 2:
+                    printSection("Liste des taches");
+                    manager.showTasks();
+                    break;
+
+                case 3:
+                    handleCompleteTask(scanner, manager);
+                    break;
+
+                case 4:
+                    handleEditTask(scanner, manager);
+                    break;
+
+                case 5:
+                    handleDeleteTask(scanner, manager);
+                    break;
+
+                case 6:
+                    System.out.println("Au revoir.");
+                    scanner.close();
+                    return;
+
+                default:
+                    System.out.println("Option invalide.");
+            }
+        }
+    }
+
+    private static void printMainMenu() {
+        System.out.println();
+        System.out.println("+======================================+");
+        System.out.println("|         TASK MANAGER - MENU          |");
+        System.out.println("+======================================+");
+        System.out.println("| 1) Ajouter une tache                 |");
+        System.out.println("| 2) Afficher les taches               |");
+        System.out.println("| 3) Terminer une tache                |");
+        System.out.println("| 4) Modifier une tache                |");
+        System.out.println("| 5) Supprimer une tache               |");
+        System.out.println("| 6) Quitter                           |");
+        System.out.println("+======================================+");
+    }
+
+    private static void printSection(String title) {
+        System.out.println("\n--- " + title + " ---");
+    }
+
+    private static int readIntInRange(Scanner scanner, String prompt, int min, int max) {
+        while (true) {
+            System.out.print(prompt);
+            String raw = scanner.nextLine().trim();
+            try {
+                int value = Integer.parseInt(raw);
+                if (value >= min && value <= max) {
+                    return value;
+                }
+                System.out.println("Saisie invalide. Entre un nombre entre " + min + " et " + max + ".");
+            } catch (NumberFormatException e) {
+                System.out.println("Saisie invalide. Entre un nombre.");
+            }
+        }
+    }
+
+    private static int readPositiveInt(Scanner scanner, String prompt) {
+        while (true) {
+            System.out.print(prompt);
+            String raw = scanner.nextLine().trim();
+            try {
+                int value = Integer.parseInt(raw);
+                if (value > 0) {
+                    return value;
+                }
+                System.out.println("Saisie invalide. Entre un ID positif.");
+            } catch (NumberFormatException e) {
+                System.out.println("Saisie invalide. Entre un nombre.");
+            }
+        }
+    }
+
+    private static String readRequiredText(Scanner scanner, String prompt) {
+        while (true) {
+            System.out.print(prompt);
+            String value = scanner.nextLine().trim();
+            if (!value.isEmpty()) {
+                return value;
+            }
+            System.out.println("Ce champ est obligatoire.");
+        }
+    }
+
+    private static String readOptionalText(Scanner scanner, String prompt) {
+        System.out.print(prompt);
+        String value = scanner.nextLine().trim();
+        return value.isEmpty() ? null : value;
+    }
+
+    private static Task.Priority readPriority(Scanner scanner) {
+        while (true) {
+            System.out.print("Etape 5/6 - Priorite (LOW, MEDIUM, HIGH, CRITICAL): ");
+            String input = scanner.nextLine().trim().toUpperCase();
+            try {
+                return Task.Priority.valueOf(input);
+            } catch (IllegalArgumentException e) {
+                System.out.println("Priorite invalide. Reessaie.");
+            }
+        }
+    }
+
+    private static Task.Priority readPriority(Scanner scanner, String prompt, Task.Priority defaultValue) {
+        while (true) {
+            System.out.print(prompt);
+            String input = scanner.nextLine().trim().toUpperCase();
+            if (input.isEmpty() && defaultValue != null) {
+                return defaultValue;
+            }
+            try {
+                return Task.Priority.valueOf(input);
+            } catch (IllegalArgumentException e) {
+                System.out.println("Priorite invalide. Reessaie.");
+            }
+        }
+    }
+
+    private static LocalDate readDeadline(Scanner scanner) {
+        while (true) {
+            System.out.print("Etape 6/6 - Deadline (YYYY-MM-DD): ");
+            String input = scanner.nextLine().trim();
+            try {
+                return LocalDate.parse(input);
+            } catch (DateTimeParseException e) {
+                System.out.println("Date invalide. Format attendu: YYYY-MM-DD.");
+            }
+        }
+    }
+
+    private static LocalDate readDeadline(Scanner scanner, String prompt, LocalDate defaultValue) {
+        while (true) {
+            System.out.print(prompt);
+            String input = scanner.nextLine().trim();
+            if (input.isEmpty() && defaultValue != null) {
+                return defaultValue;
+            }
+            try {
+                return LocalDate.parse(input);
+            } catch (DateTimeParseException e) {
+                System.out.println("Date invalide. Format attendu: YYYY-MM-DD.");
+            }
+        }
+    }
+
+    private static String readRequiredTextWithDefault(Scanner scanner, String prompt, String currentValue) {
+        while (true) {
+            System.out.print(prompt);
+            String value = scanner.nextLine().trim();
+            if (value.isEmpty()) {
+                return currentValue;
+            }
+            if (!value.isBlank()) {
+                return value;
+            }
+            System.out.println("Ce champ est obligatoire.");
+        }
+    }
+
+    private static String readOptionalTextWithDefault(Scanner scanner, String prompt, String currentValue) {
+        System.out.print(prompt);
+        String value = scanner.nextLine().trim();
+        if (value.isEmpty()) {
+            return currentValue;
+        }
+        if ("-".equals(value)) {
+            return null;
+        }
+        return value;
+    }
+
+    private static boolean readBooleanWithDefault(Scanner scanner, String prompt, boolean currentValue) {
+        while (true) {
+            System.out.print(prompt);
+            String value = scanner.nextLine().trim().toLowerCase();
+            if (value.isEmpty()) {
+                return currentValue;
+            }
+            if (value.equals("o") || value.equals("oui") || value.equals("y") || value.equals("yes")) {
+                return true;
+            }
+            if (value.equals("n") || value.equals("non") || value.equals("no")) {
+                return false;
+            }
+            System.out.println("Saisie invalide. Reponds par oui/non ou laisse vide pour conserver.");
+        }
+    }
+
+    private static void handleCreateTask(Scanner scanner, TaskManager manager) {
+        printSection("Creation guidee d'une tache");
+        int typeChoice = readIntInRange(scanner, "Etape 1/6 - Type (1=Simple, 2=Deadline): ", 1, 2);
+        String title = readRequiredText(scanner, "Etape 2/6 - Titre: ");
+        String description = readRequiredText(scanner, "Etape 3/6 - Description: ");
+        String subjectName = readOptionalText(scanner, "Etape 4/6 - Matiere (optionnel): ");
+        Task.Priority priority = readPriority(scanner);
+
+        try {
+            if (typeChoice == 1) {
+                manager.addTask(new SimpleTask(title, description, priority, subjectName));
+            } else {
+                LocalDate deadline = readDeadline(scanner);
+                manager.addTask(new DeadlineTask(title, description, priority, deadline, subjectName));
+            }
+        } catch (SQLException e) {
+            System.out.println("Erreur pendant l'enregistrement: " + e.getMessage());
+        }
+    }
+
+    private static void handleCompleteTask(Scanner scanner, TaskManager manager) {
+        printSection("Terminer une tache");
+        manager.showTasks();
+        int taskId = readPositiveInt(scanner, "ID de la tache a terminer: ");
+        try {
+            manager.completeTaskById(taskId);
+        } catch (SQLException e) {
+            System.out.println("Erreur pendant la mise a jour: " + e.getMessage());
+        }
+    }
+
+            private static void handleEditTask(Scanner scanner, TaskManager manager) {
+            printSection("Modifier une tache");
+            manager.showTasks();
+            int taskId = readPositiveInt(scanner, "ID de la tache a modifier: ");
+            Task existingTask = manager.findTaskById(taskId);
+
+            if (existingTask == null) {
+                System.out.println("Tâche non trouvée");
+                return;
+            }
+
+            int currentType = existingTask instanceof DeadlineTask ? 2 : 1;
+            int typeChoice = readIntInRange(scanner,
+                "Type (1=Simple, 2=Deadline, actuel=" + currentType + "): ",
+                1,
+                2);
+            String title = readRequiredTextWithDefault(scanner,
+                "Titre actuel [" + existingTask.getTitle() + "] (Entree=conserver): ",
+                existingTask.getTitle());
+            String description = readRequiredTextWithDefault(scanner,
+                "Description actuelle [" + existingTask.getDescription() + "] (Entree=conserver): ",
+                existingTask.getDescription());
+            String currentSubject = existingTask.getSubjectName() == null ? "-" : existingTask.getSubjectName();
+            String subjectName = readOptionalTextWithDefault(scanner,
+                "Matiere actuelle [" + currentSubject + "] (Entree=conserver, -=vider): ",
+                existingTask.getSubjectName());
+            Task.Priority priority = readPriority(scanner,
+                "Priorite actuelle [" + existingTask.getPriority() + "] (Entree=conserver): ",
+                existingTask.getPriority());
+            boolean completed = readBooleanWithDefault(scanner,
+                "Etat termine ? (oui/non, actuel=" + (existingTask.isCompleted() ? "oui" : "non") + ", Entree=conserver): ",
+                existingTask.isCompleted());
+
+            Task updatedTask;
+            if (typeChoice == 2) {
+                LocalDate currentDeadline = existingTask instanceof DeadlineTask
+                    ? ((DeadlineTask) existingTask).getDeadline()
+                    : null;
+                String deadlinePrompt = currentDeadline == null
+                    ? "Deadline (YYYY-MM-DD): "
+                    : "Deadline actuelle [" + currentDeadline + "] (Entree=conserver): ";
+                LocalDate deadline = readDeadline(scanner, deadlinePrompt, currentDeadline);
+                updatedTask = new DeadlineTask(taskId, title, description, priority, completed, deadline, subjectName);
+            } else {
+                updatedTask = new SimpleTask(taskId, title, description, priority, completed, subjectName);
+            }
+
+            try {
+                manager.updateTask(updatedTask);
+            } catch (SQLException e) {
+                System.out.println("Erreur pendant la modification: " + e.getMessage());
+            }
+            }
+
+    private static void handleDeleteTask(Scanner scanner, TaskManager manager) {
+        printSection("Supprimer une tache");
+        manager.showTasks();
+        int taskId = readPositiveInt(scanner, "ID de la tache a supprimer: ");
+        try {
+            manager.removeTaskById(taskId);
+        } catch (SQLException e) {
+            System.out.println("Erreur pendant la suppression: " + e.getMessage());
+        }
+    }
+}
