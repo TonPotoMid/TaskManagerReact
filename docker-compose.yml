@@ -1,0 +1,39 @@
+services:
+  db:
+    image: postgres:16-alpine
+    container_name: task-manager-db
+    environment:
+      POSTGRES_DB: task_manager
+      POSTGRES_USER: postgres
+      POSTGRES_PASSWORD: postgres
+    ports:
+      - "5432:5432"
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+
+  backend:
+    build:
+      context: ./JavaTaskManager
+      dockerfile: Dockerfile
+    container_name: task-manager-backend
+    depends_on:
+      - db
+    environment:
+      TASK_DB_URL: jdbc:postgresql://db:5432/task_manager
+      TASK_DB_USER: postgres
+      TASK_DB_PASSWORD: postgres
+    ports:
+      - "8080:8080"
+
+  frontend:
+    build:
+      context: ./task-manager-ui
+      dockerfile: Dockerfile
+    container_name: task-manager-frontend
+    depends_on:
+      - backend
+    ports:
+      - "5173:5173"
+
+volumes:
+  pgdata:

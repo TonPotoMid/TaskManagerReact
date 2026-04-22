@@ -1,6 +1,7 @@
 package repository;
 
 import model.Task;
+import model.TaskHistory;
 
 import java.sql.Connection;
 import java.sql.Date;
@@ -8,6 +9,8 @@ import java.sql.DriverManager;
 import java.sql.PreparedStatement;
 import java.sql.ResultSet;
 import java.sql.SQLException;
+import java.sql.Timestamp;
+import java.time.LocalDateTime;
 import java.util.ArrayList;
 import java.util.List;
 
@@ -16,11 +19,13 @@ public class DatabaseManager {
         private final int id;
         private final String username;
         private final String role;
+        private final String avatarUrl;
 
-        public AuthUser(int id, String username, String role) {
+        public AuthUser(int id, String username, String role, String avatarUrl) {
             this.id = id;
             this.username = username;
             this.role = role;
+            this.avatarUrl = avatarUrl;
         }
 
         public int getId() {
@@ -33,6 +38,10 @@ public class DatabaseManager {
 
         public String getRole() {
             return role;
+        }
+
+        public String getAvatarUrl() {
+            return avatarUrl;
         }
     }
 
@@ -55,6 +64,7 @@ public class DatabaseManager {
     public List<Task> loadTasksByUser(int userId) throws SQLException {
         ensureCategoryColumn();
         ensureSecuritySchema();
+        ensureHistorySchema();
 
         List<Task> tasks = new ArrayList<>();
         String sql = "SELECT t.id, t.title, t.description, t.priority, t.state, t.deadline, t.category, " +
@@ -69,19 +79,7 @@ public class DatabaseManager {
 
             try (ResultSet resultSet = statement.executeQuery()) {
                 while (resultSet.next()) {
-                    Date deadlineValue = resultSet.getDate("deadline");
-                    String rawCategory = resultSet.getString("category");
-                    String category = normalizeCategory(rawCategory, deadlineValue == null ? null : deadlineValue.toLocalDate());
-                    tasks.add(new Task(
-                            resultSet.getInt("id"),
-                            resultSet.getString("title"),
-                            resultSet.getString("description"),
-                            resultSet.getBoolean("state"),
-                            resultSet.getString("priority"),
-                            resultSet.getString("subject_name"),
-                            deadlineValue == null ? null : deadlineValue.toLocalDate(),
-                            category
-                    ));
+                    tasks.add(mapTask(resultSet));
                 }
             }
         }
@@ -89,9 +87,48 @@ public class DatabaseManager {
         return tasks;
     }
 
+    public List<TaskHistory> loadTaskHistory(int taskId, int userId) throws SQLException {
+        ensureCategoryColumn();
+        ensureSecuritySchema();
+        ensureHistorySchema();
+
+        List<TaskHistory> history = new ArrayList<>();
+        String sql = "SELECT id, task_id, action, changed_at, title, description, priority, state, deadline, category, subject_name " +
+                "FROM task_history WHERE task_id = ? AND user_id = ? ORDER BY changed_at DESC, id DESC";
+
+        try (Connection connection = openConnection();
+             PreparedStatement statement = connection.prepareStatement(sql)) {
+            statement.setInt(1, taskId);
+            statement.setInt(2, userId);
+
+            try (ResultSet resultSet = statement.executeQuery()) {
+                while (resultSet.next()) {
+                    Timestamp changedAt = resultSet.getTimestamp("changed_at");
+                    Date deadline = resultSet.getDate("deadline");
+                    history.add(new TaskHistory(
+                            resultSet.getInt("id"),
+                            resultSet.getInt("task_id"),
+                            resultSet.getString("action"),
+                            changedAt == null ? null : changedAt.toLocalDateTime(),
+                            resultSet.getString("title"),
+                            resultSet.getString("description"),
+                            resultSet.getString("priority"),
+                            resultSet.getBoolean("state"),
+                            deadline == null ? null : deadline.toLocalDate(),
+                            resultSet.getString("category"),
+                            resultSet.getString("subject_name")
+                    ));
+                }
+            }
+        }
+
+        return history;
+    }
+
     public int insertTask(Task task, int userId) throws SQLException {
         ensureCategoryColumn();
         ensureSecuritySchema();
+        ensureHistorySchema();
 
         String sql = "INSERT INTO task (title, description, priority, state, deadline, category, subject_id, user_id) " +
                 "VALUES (?, ?, ?, ?, ?, ?, ?, ?) RETURNING id";
@@ -122,7 +159,10 @@ public class DatabaseManager {
 
             try (ResultSet resultSet = statement.executeQuery()) {
                 if (resultSet.next()) {
-                    return resultSet.getInt("id");
+                    int id = resultSet.getInt("id");
+                    task.setId(id);
+                    recordTaskHistory(connection, task, userId, "CREATED");
+                    return id;
                 }
             }
         }
@@ -132,33 +172,59 @@ public class DatabaseManager {
 
     public boolean completeTask(int id, int userId) throws SQLException {
         ensureSecuritySchema();
+        ensureCategoryColumn();
+        ensureHistorySchema();
 
         String sql = "UPDATE task SET state = TRUE WHERE id = ? AND user_id = ?";
 
         try (Connection connection = openConnection();
              PreparedStatement statement = connection.prepareStatement(sql)) {
+            Task existing = loadTaskById(connection, id, userId);
+            if (existing == null) {
+                return false;
+            }
+
             statement.setInt(1, id);
             statement.setInt(2, userId);
-            return statement.executeUpdate() > 0;
+            boolean updated = statement.executeUpdate() > 0;
+            if (updated) {
+                Task updatedTask = loadTaskById(connection, id, userId);
+                if (updatedTask != null) {
+                    recordTaskHistory(connection, updatedTask, userId, "COMPLETED");
+                }
+            }
+            return updated;
         }
     }
 
     public boolean deleteTask(int id, int userId) throws SQLException {
         ensureSecuritySchema();
+        ensureCategoryColumn();
+        ensureHistorySchema();
 
         String sql = "DELETE FROM task WHERE id = ? AND user_id = ?";
 
         try (Connection connection = openConnection();
              PreparedStatement statement = connection.prepareStatement(sql)) {
+            Task existing = loadTaskById(connection, id, userId);
+            if (existing == null) {
+                return false;
+            }
+
             statement.setInt(1, id);
             statement.setInt(2, userId);
-            return statement.executeUpdate() > 0;
+            boolean deleted = statement.executeUpdate() > 0;
+            if (deleted) {
+                recordTaskHistory(connection, existing, userId, "DELETED");
+            }
+            return deleted;
         }
     }
 
     public boolean updateTask(Task task, int userId) throws SQLException {
         ensureCategoryColumn();
         ensureSecuritySchema();
+        ensureHistorySchema();
 
         String sql = "UPDATE task SET title = ?, description = ?, priority = ?, state = ?, deadline = ?, category = ?, subject_id = ? " +
                 "WHERE id = ? AND user_id = ?";
@@ -187,7 +253,14 @@ public class DatabaseManager {
 
             statement.setInt(8, task.getId());
             statement.setInt(9, userId);
-            return statement.executeUpdate() > 0;
+            boolean updated = statement.executeUpdate() > 0;
+            if (updated) {
+                Task updatedTask = loadTaskById(connection, task.getId(), userId);
+                if (updatedTask != null) {
+                    recordTaskHistory(connection, updatedTask, userId, "UPDATED");
+                }
+            }
+            return updated;
         }
     }
 
@@ -205,7 +278,7 @@ public class DatabaseManager {
             }
         }
 
-        String insertSql = "INSERT INTO app_user (username, password, role) VALUES (?, ?, ?) RETURNING id, role";
+        String insertSql = "INSERT INTO app_user (username, password, role) VALUES (?, ?, ?) RETURNING id, role, avatar_url";
         try (Connection connection = openConnection();
              PreparedStatement insertStatement = connection.prepareStatement(insertSql)) {
             insertStatement.setString(1, username);
@@ -213,7 +286,7 @@ public class DatabaseManager {
             insertStatement.setString(3, "USER");
             try (ResultSet rs = insertStatement.executeQuery()) {
                 if (rs.next()) {
-                    return new AuthUser(rs.getInt("id"), username, rs.getString("role"));
+                    return new AuthUser(rs.getInt("id"), username, rs.getString("role"), rs.getString("avatar_url"));
                 }
             }
         }
@@ -224,7 +297,7 @@ public class DatabaseManager {
     public AuthUser authenticateUser(String username, String password) throws SQLException {
         ensureSecuritySchema();
 
-        String sql = "SELECT id, role FROM app_user WHERE username = ? AND password = ?";
+        String sql = "SELECT id, role, avatar_url FROM app_user WHERE username = ? AND password = ?";
         try (Connection connection = openConnection();
              PreparedStatement statement = connection.prepareStatement(sql)) {
             statement.setString(1, username);
@@ -232,7 +305,40 @@ public class DatabaseManager {
 
             try (ResultSet rs = statement.executeQuery()) {
                 if (rs.next()) {
-                    return new AuthUser(rs.getInt("id"), username, rs.getString("role"));
+                    return new AuthUser(rs.getInt("id"), username, rs.getString("role"), rs.getString("avatar_url"));
+                }
+            }
+        }
+
+        return null;
+    }
+
+    public boolean updateUserAvatarUrl(int userId, String avatarUrl) throws SQLException {
+        ensureSecuritySchema();
+
+        String sql = "UPDATE app_user SET avatar_url = ? WHERE id = ?";
+        try (Connection connection = openConnection();
+             PreparedStatement statement = connection.prepareStatement(sql)) {
+            if (avatarUrl == null || avatarUrl.isBlank()) {
+                statement.setString(1, null);
+            } else {
+                statement.setString(1, avatarUrl.trim());
+            }
+            statement.setInt(2, userId);
+            return statement.executeUpdate() > 0;
+        }
+    }
+
+    public AuthUser loadAuthUserById(int userId) throws SQLException {
+        ensureSecuritySchema();
+
+        String sql = "SELECT id, username, role, avatar_url FROM app_user WHERE id = ?";
+        try (Connection connection = openConnection();
+             PreparedStatement statement = connection.prepareStatement(sql)) {
+            statement.setInt(1, userId);
+            try (ResultSet rs = statement.executeQuery()) {
+                if (rs.next()) {
+                    return new AuthUser(rs.getInt("id"), rs.getString("username"), rs.getString("role"), rs.getString("avatar_url"));
                 }
             }
         }
@@ -246,6 +352,93 @@ public class DatabaseManager {
              PreparedStatement statement = connection.prepareStatement(sql)) {
             statement.execute();
         }
+    }
+
+    private void ensureHistorySchema() throws SQLException {
+        String createHistorySql = "CREATE TABLE IF NOT EXISTS task_history (" +
+                "id SERIAL PRIMARY KEY, " +
+                "task_id INTEGER NOT NULL, " +
+                "user_id INTEGER NOT NULL REFERENCES app_user(id), " +
+                "action VARCHAR(30) NOT NULL, " +
+                "changed_at TIMESTAMP NOT NULL DEFAULT NOW(), " +
+                "title VARCHAR(150) NOT NULL, " +
+                "description TEXT NOT NULL, " +
+                "priority VARCHAR(20) NOT NULL, " +
+                "state BOOLEAN NOT NULL, " +
+                "deadline DATE, " +
+                "category VARCHAR(40), " +
+                "subject_name VARCHAR(100)" +
+                ")";
+
+        String taskHistoryTaskIdIndexSql = "CREATE INDEX IF NOT EXISTS idx_task_history_task_id ON task_history(task_id)";
+        String taskHistoryUserIdIndexSql = "CREATE INDEX IF NOT EXISTS idx_task_history_user_id ON task_history(user_id)";
+
+        try (Connection connection = openConnection();
+             PreparedStatement createStatement = connection.prepareStatement(createHistorySql);
+             PreparedStatement taskIndexStatement = connection.prepareStatement(taskHistoryTaskIdIndexSql);
+             PreparedStatement userIndexStatement = connection.prepareStatement(taskHistoryUserIdIndexSql)) {
+            createStatement.execute();
+            taskIndexStatement.execute();
+            userIndexStatement.execute();
+        }
+    }
+
+    private void recordTaskHistory(Connection connection, Task task, int userId, String action) throws SQLException {
+        String sql = "INSERT INTO task_history (task_id, user_id, action, changed_at, title, description, priority, state, deadline, category, subject_name) " +
+                "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)";
+        try (PreparedStatement statement = connection.prepareStatement(sql)) {
+            statement.setInt(1, task.getId());
+            statement.setInt(2, userId);
+            statement.setString(3, action);
+            statement.setTimestamp(4, Timestamp.valueOf(LocalDateTime.now()));
+            statement.setString(5, task.getTitle());
+            statement.setString(6, task.getDescription());
+            statement.setString(7, task.getPriority() == null ? "MEDIUM" : task.getPriority());
+            statement.setBoolean(8, task.isCompleted());
+            if (task.getDeadline() == null) {
+                statement.setDate(9, null);
+            } else {
+                statement.setDate(9, Date.valueOf(task.getDeadline()));
+            }
+            statement.setString(10, normalizeCategory(task.getCategory(), task.getDeadline()));
+            statement.setString(11, task.getSubjectName());
+            statement.executeUpdate();
+        }
+    }
+
+    private Task loadTaskById(Connection connection, int taskId, int userId) throws SQLException {
+        String sql = "SELECT t.id, t.title, t.description, t.priority, t.state, t.deadline, t.category, " +
+                "s.name AS subject_name FROM task t " +
+                "LEFT JOIN subject s ON s.id = t.subject_id " +
+                "WHERE t.id = ? AND t.user_id = ?";
+
+        try (PreparedStatement statement = connection.prepareStatement(sql)) {
+            statement.setInt(1, taskId);
+            statement.setInt(2, userId);
+            try (ResultSet resultSet = statement.executeQuery()) {
+                if (resultSet.next()) {
+                    return mapTask(resultSet);
+                }
+            }
+        }
+
+        return null;
+    }
+
+    private Task mapTask(ResultSet resultSet) throws SQLException {
+        Date deadlineValue = resultSet.getDate("deadline");
+        String rawCategory = resultSet.getString("category");
+        String category = normalizeCategory(rawCategory, deadlineValue == null ? null : deadlineValue.toLocalDate());
+        return new Task(
+                resultSet.getInt("id"),
+                resultSet.getString("title"),
+                resultSet.getString("description"),
+                resultSet.getBoolean("state"),
+                resultSet.getString("priority"),
+                resultSet.getString("subject_name"),
+                deadlineValue == null ? null : deadlineValue.toLocalDate(),
+                category
+        );
     }
 
     private void ensureSecuritySchema() throws SQLException {
@@ -263,17 +456,20 @@ public class DatabaseManager {
 
         String seedAdminSql = "INSERT INTO app_user (username, password, role) VALUES ('admin', 'admin123', 'ADMIN') ON CONFLICT (username) DO NOTHING";
         String seedUserSql = "INSERT INTO app_user (username, password, role) VALUES ('user', 'user123', 'USER') ON CONFLICT (username) DO NOTHING";
+           String addAvatarSql = "ALTER TABLE app_user ADD COLUMN IF NOT EXISTS avatar_url VARCHAR(1000)";
 
         try (Connection connection = openConnection();
              PreparedStatement createUserStatement = connection.prepareStatement(createUserSql);
              PreparedStatement seedAdminStatement = connection.prepareStatement(seedAdminSql);
              PreparedStatement seedUserStatement = connection.prepareStatement(seedUserSql);
+               PreparedStatement addAvatarStatement = connection.prepareStatement(addAvatarSql);
              PreparedStatement addOwnerStatement = connection.prepareStatement(addOwnerSql);
              PreparedStatement backfillStatement = connection.prepareStatement(backfillSql);
              PreparedStatement setNotNullStatement = connection.prepareStatement(setNotNullSql)) {
             createUserStatement.execute();
             seedAdminStatement.execute();
             seedUserStatement.execute();
+              addAvatarStatement.execute();
             addOwnerStatement.execute();
             backfillStatement.execute();
             try {

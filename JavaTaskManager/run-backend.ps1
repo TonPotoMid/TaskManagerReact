@@ -31,7 +31,7 @@ if (-not $env:TASK_DB_PASSWORD -or $env:TASK_DB_PASSWORD.Trim() -eq "") {
     $env:TASK_DB_PASSWORD = Read-Host "Enter PostgreSQL password for user '$($env:TASK_DB_USER)'"
 }
 
-& $javac -cp ".;lib/postgresql-42.7.5.jar" Main.java controller\TaskController.java service\TaskManager.java repository\DatabaseManager.java model\Task.java
+& $javac -cp ".;lib/postgresql-42.7.5.jar" Main.java controller\TaskController.java service\TaskManager.java repository\DatabaseManager.java model\Task.java model\TaskHistory.java
 Write-Host "Compilation OK."
 
 Write-Host "Starting backend..."
