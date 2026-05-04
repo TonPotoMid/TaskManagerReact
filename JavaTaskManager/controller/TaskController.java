@@ -666,14 +666,65 @@ public class TaskController {
 	}
 
 	private boolean sendLoginCodeEmail(String toEmail, String code) {
+		String brevoApiKey = System.getenv("BREVO_API_KEY");
 		String webhookUrl = System.getenv("TASK_LOGIN_MAIL_WEBHOOK_URL");
 		String webhookToken = System.getenv("TASK_LOGIN_MAIL_WEBHOOK_TOKEN");
 
-		if (webhookUrl == null || webhookUrl.isBlank()) {
-			System.out.println("[AUTH 2FA] Code pour " + toEmail + " : " + code + " (mode dev, webhook non configure)");
+		// Mode dev : aucune config
+		if ((brevoApiKey == null || brevoApiKey.isBlank()) && (webhookUrl == null || webhookUrl.isBlank())) {
+			System.out.println("[AUTH 2FA] Code pour " + toEmail + " : " + code + " (mode dev, email non configure)");
 			return true;
 		}
 
+		// Mode Brevo API
+		if (brevoApiKey != null && !brevoApiKey.isBlank()) {
+			return sendViaBrevo(toEmail, code, brevoApiKey);
+		}
+
+		// Mode webhook (fallback)
+		return sendViaWebhook(toEmail, code, webhookUrl, webhookToken);
+	}
+
+	private boolean sendViaBrevo(String toEmail, String code, String apiKey) {
+		String senderEmail = System.getenv("BREVO_SENDER_EMAIL");
+		if (senderEmail == null || senderEmail.isBlank()) {
+			senderEmail = "noreply@taskmanager.local";
+		}
+		String senderName = "Task Manager";
+		String subject = "Votre code de connexion";
+		String textContent = "Votre code de connexion est : " + code + ". Il expire dans 10 minutes.";
+
+		String payload = "{" +
+				"\"sender\":{\"name\":\"" + escapeJson(senderName) + "\",\"email\":\"" + escapeJson(senderEmail) + "\"}," +
+				"\"to\":[{\"email\":\"" + escapeJson(toEmail) + "\"}]," +
+				"\"subject\":\"" + escapeJson(subject) + "\"," +
+				"\"textContent\":\"" + escapeJson(textContent) + "\"" +
+				"}";
+
+		try {
+			HttpRequest request = HttpRequest.newBuilder()
+					.uri(URI.create("https://api.brevo.com/v3/smtp/email"))
+					.header("Content-Type", "application/json")
+					.header("api-key", apiKey)
+					.POST(HttpRequest.BodyPublishers.ofString(payload))
+					.build();
+
+			HttpResponse<String> response = httpClient.send(request, HttpResponse.BodyHandlers.ofString());
+			if (response.statusCode() >= 200 && response.statusCode() < 300) {
+				System.out.println("[AUTH 2FA] Email Brevo envoye a " + toEmail);
+				return true;
+			} else {
+				System.err.println("[AUTH 2FA] Erreur Brevo " + response.statusCode() + " : " + response.body());
+				return false;
+			}
+		} catch (IOException | InterruptedException e) {
+			if (e instanceof InterruptedException) Thread.currentThread().interrupt();
+			System.err.println("[AUTH 2FA] Exception Brevo : " + e.getMessage());
+			return false;
+		}
+	}
+
+	private boolean sendViaWebhook(String toEmail, String code, String webhookUrl, String webhookToken) {
 		try {
 			String payload = "{" +
 					"\"to\":\"" + escapeJson(toEmail) + "\"," +
@@ -693,9 +744,7 @@ public class TaskController {
 			HttpResponse<String> response = httpClient.send(requestBuilder.build(), HttpResponse.BodyHandlers.ofString());
 			return response.statusCode() >= 200 && response.statusCode() < 300;
 		} catch (IOException | InterruptedException e) {
-			if (e instanceof InterruptedException) {
-				Thread.currentThread().interrupt();
-			}
+			if (e instanceof InterruptedException) Thread.currentThread().interrupt();
 			return false;
 		}
 	}

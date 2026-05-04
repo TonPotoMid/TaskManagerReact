@@ -507,6 +507,7 @@ function App() {
     (_, index) => adjustedWindowStart + index,
   )
 
+
   useEffect(() => {
     setCurrentPage(1)
   }, [searchTerm, subjectFilter, priorityFilter, deadlineFilter, statusFilter])
@@ -905,6 +906,7 @@ function App() {
                     Réinitialiser
                   </button>
                 )}
+
               </section>
 
               <section className="table-shell">
