@@ -39,16 +39,34 @@ public class TaskController {
 		private final String username;
 		private final String role;
 		private final String avatarUrl;
+		private final String displayName;
 		private final String email;
 		private final String codeHash;
 		private final long expiresAtMs;
 		private int attempts;
 
-		private PendingLogin(int userId, String username, String role, String avatarUrl, String email, String codeHash, long expiresAtMs) {
+		private PendingLogin(int userId, String username, String role, String avatarUrl, String displayName, String email, String codeHash, long expiresAtMs) {
 			this.userId = userId;
 			this.username = username;
 			this.role = role;
 			this.avatarUrl = avatarUrl;
+			this.displayName = displayName;
+			this.email = email;
+			this.codeHash = codeHash;
+			this.expiresAtMs = expiresAtMs;
+			this.attempts = 0;
+		}
+	}
+
+	private static class PendingPasswordReset {
+		private final int userId;
+		private final String email;
+		private final String codeHash;
+		private final long expiresAtMs;
+		private int attempts;
+
+		private PendingPasswordReset(int userId, String email, String codeHash, long expiresAtMs) {
+			this.userId = userId;
 			this.email = email;
 			this.codeHash = codeHash;
 			this.expiresAtMs = expiresAtMs;
@@ -68,21 +86,42 @@ public class TaskController {
 		}
 	}
 
+	private static class PublicIdentity {
+		private final String displayName;
+		private final String givenName;
+		private final String familyName;
+		private final String maskedEmail;
+
+		private PublicIdentity(String displayName, String givenName, String familyName, String maskedEmail) {
+			this.displayName = displayName;
+			this.givenName = givenName;
+			this.familyName = familyName;
+			this.maskedEmail = maskedEmail;
+		}
+	}
+
 	private final HttpServer server;
 	private final TaskManager taskManager;
 	private final Map<String, Session> sessions;
 	private final Map<String, PendingLogin> pendingLogins;
+	private final Map<String, PendingPasswordReset> pendingPasswordResets;
 	private final HttpClient httpClient;
 
 	public TaskController(int port) throws IOException {
 		this.taskManager = new TaskManager();
 		this.sessions = new ConcurrentHashMap<>();
 		this.pendingLogins = new ConcurrentHashMap<>();
+		this.pendingPasswordResets = new ConcurrentHashMap<>();
 		this.httpClient = HttpClient.newHttpClient();
 		this.server = HttpServer.create(new InetSocketAddress(port), 0);
 		this.server.createContext("/api/auth/login", new LoginHandler());
 		this.server.createContext("/api/auth/verify", new VerifyLoginHandler());
 		this.server.createContext("/api/auth/register", new RegisterHandler());
+		this.server.createContext("/api/auth/password/request", new PasswordResetRequestHandler());
+		this.server.createContext("/api/auth/password/reset", new PasswordResetConfirmHandler());
+		this.server.createContext("/api/users/me/profile", new ProfileHandler());
+		this.server.createContext("/api/users/me", new MeHandler());
+		this.server.createContext("/api/admin/users", new AdminUsersHandler());
 		this.server.createContext("/api/users/me/avatar", new AvatarHandler());
 		this.server.createContext("/api/tasks", new TaskHandler());
 		this.server.setExecutor(null);
@@ -223,10 +262,9 @@ public class TaskController {
 				if (!isValidEmail(userEmail)) {
 					String token = UUID.randomUUID().toString();
 					sessions.put(token, new Session(user.getId(), user.getUsername(), user.getRole()));
-					writeJson(exchange, 200,
-							"{\"token\":\"" + escapeJson(token) + "\",\"username\":\"" + escapeJson(user.getUsername()) + "\",\"role\":\"" + escapeJson(user.getRole()) + "\",\"avatarUrl\":" + toJsonNullableString(user.getAvatarUrl()) + "}");
-					return;
-				}
+				writeJson(exchange, 200, authPayload(token, user.getUsername(), user.getRole(), user.getAvatarUrl(), user.getDisplayName()));
+				return;
+			}
 
 				String code = generateLoginCode();
 				String challengeToken = UUID.randomUUID().toString();
@@ -235,6 +273,7 @@ public class TaskController {
 						user.getUsername(),
 						user.getRole(),
 						user.getAvatarUrl(),
+						user.getDisplayName(),
 						userEmail,
 						hashValue(code),
 						System.currentTimeMillis() + LOGIN_CODE_TTL_MS
@@ -313,8 +352,7 @@ public class TaskController {
 			pendingLogins.remove(challengeToken);
 			String token = UUID.randomUUID().toString();
 			sessions.put(token, new Session(pendingLogin.userId, pendingLogin.username, pendingLogin.role));
-			writeJson(exchange, 200,
-					"{\"token\":\"" + escapeJson(token) + "\",\"username\":\"" + escapeJson(pendingLogin.username) + "\",\"role\":\"" + escapeJson(pendingLogin.role) + "\",\"avatarUrl\":" + toJsonNullableString(pendingLogin.avatarUrl) + "}");
+			writeJson(exchange, 200, authPayload(token, pendingLogin.username, pendingLogin.role, pendingLogin.avatarUrl, pendingLogin.displayName));
 		}
 	}
 
@@ -362,8 +400,213 @@ public class TaskController {
 
 				String token = UUID.randomUUID().toString();
 				sessions.put(token, new Session(user.getId(), user.getUsername(), user.getRole()));
-				writeJson(exchange, 201,
-						"{\"token\":\"" + escapeJson(token) + "\",\"username\":\"" + escapeJson(user.getUsername()) + "\",\"role\":\"" + escapeJson(user.getRole()) + "\",\"avatarUrl\":" + toJsonNullableString(user.getAvatarUrl()) + "}");
+				writeJson(exchange, 201, authPayload(token, user.getUsername(), user.getRole(), user.getAvatarUrl(), user.getDisplayName()));
+			} catch (SQLException e) {
+				writeJson(exchange, 500, "{\"error\":\"Database error\"}");
+			}
+		}
+	}
+
+	private class PasswordResetRequestHandler implements HttpHandler {
+		@Override
+		public void handle(HttpExchange exchange) throws IOException {
+			addCorsHeaders(exchange);
+			if ("OPTIONS".equalsIgnoreCase(exchange.getRequestMethod())) {
+				exchange.sendResponseHeaders(204, -1);
+				exchange.close();
+				return;
+			}
+
+			if (!"POST".equalsIgnoreCase(exchange.getRequestMethod())) {
+				writeJson(exchange, 405, "{\"error\":\"Method not allowed\"}");
+				return;
+			}
+
+			try {
+				String body = new String(exchange.getRequestBody().readAllBytes(), StandardCharsets.UTF_8);
+				String username = extractString(body, "username");
+				if (username == null || username.isBlank()) {
+					writeJson(exchange, 400, "{\"error\":\"Adresse e-mail requise\"}");
+					return;
+				}
+
+				cleanupExpiredPendingPasswordResets();
+				TaskManager.AuthUser user = taskManager.getAuthUserByUsername(username.trim());
+				if (user == null || !isValidEmail(user.getUsername())) {
+					writeJson(exchange, 200, "{\"accepted\":true}");
+					return;
+				}
+
+				String email = user.getUsername();
+				String code = generateLoginCode();
+				String challengeToken = UUID.randomUUID().toString();
+				pendingPasswordResets.put(
+						challengeToken,
+						new PendingPasswordReset(user.getId(), email, hashValue(code), System.currentTimeMillis() + LOGIN_CODE_TTL_MS)
+				);
+
+				boolean mailSent = sendLoginCodeEmail(email, code);
+				if (!mailSent) {
+					pendingPasswordResets.remove(challengeToken);
+					writeJson(exchange, 500, "{\"error\":\"Impossible d'envoyer le code\"}");
+					return;
+				}
+
+				writeJson(exchange, 202,
+						"{\"requiresPasswordReset\":true,\"challengeToken\":\"" + escapeJson(challengeToken) +
+						"\",\"maskedEmail\":\"" + escapeJson(maskEmail(email)) + "\"}");
+			} catch (SQLException e) {
+				writeJson(exchange, 500, "{\"error\":\"Database error\"}");
+			}
+		}
+	}
+
+	private class PasswordResetConfirmHandler implements HttpHandler {
+		@Override
+		public void handle(HttpExchange exchange) throws IOException {
+			addCorsHeaders(exchange);
+			if ("OPTIONS".equalsIgnoreCase(exchange.getRequestMethod())) {
+				exchange.sendResponseHeaders(204, -1);
+				exchange.close();
+				return;
+			}
+
+			if (!"POST".equalsIgnoreCase(exchange.getRequestMethod())) {
+				writeJson(exchange, 405, "{\"error\":\"Method not allowed\"}");
+				return;
+			}
+
+			String body = new String(exchange.getRequestBody().readAllBytes(), StandardCharsets.UTF_8);
+			String challengeToken = extractString(body, "challengeToken");
+			String code = extractString(body, "code");
+			String newPassword = extractString(body, "newPassword");
+
+			if (challengeToken == null || challengeToken.isBlank() || code == null || code.isBlank() || newPassword == null || newPassword.isBlank()) {
+				writeJson(exchange, 400, "{\"error\":\"challengeToken, code et newPassword requis\"}");
+				return;
+			}
+
+			if (!isStrongPassword(newPassword)) {
+				writeJson(exchange, 400, "{\"error\":\"Mot de passe trop faible: minimum 12 caracteres et un caractere special\"}");
+				return;
+			}
+
+			cleanupExpiredPendingPasswordResets();
+			PendingPasswordReset pending = pendingPasswordResets.get(challengeToken);
+			if (pending == null) {
+				writeJson(exchange, 401, "{\"error\":\"Code invalide ou expire\"}");
+				return;
+			}
+
+			if (System.currentTimeMillis() > pending.expiresAtMs) {
+				pendingPasswordResets.remove(challengeToken);
+				writeJson(exchange, 401, "{\"error\":\"Code expire\"}");
+				return;
+			}
+
+			if (pending.attempts >= LOGIN_CODE_MAX_ATTEMPTS) {
+				pendingPasswordResets.remove(challengeToken);
+				writeJson(exchange, 429, "{\"error\":\"Trop de tentatives\"}");
+				return;
+			}
+
+			String providedHash = hashValue(code.trim());
+			if (!providedHash.equals(pending.codeHash)) {
+				pending.attempts++;
+				if (pending.attempts >= LOGIN_CODE_MAX_ATTEMPTS) {
+					pendingPasswordResets.remove(challengeToken);
+				}
+				writeJson(exchange, 401, "{\"error\":\"Code invalide\"}");
+				return;
+			}
+
+			try {
+				boolean updated = taskManager.updatePassword(pending.userId, newPassword);
+				pendingPasswordResets.remove(challengeToken);
+				if (!updated) {
+					writeJson(exchange, 404, "{\"error\":\"User not found\"}");
+					return;
+				}
+				writeJson(exchange, 200, "{\"updated\":true}");
+			} catch (SQLException e) {
+				writeJson(exchange, 500, "{\"error\":\"Database error\"}");
+			}
+		}
+	}
+
+	private class MeHandler implements HttpHandler {
+		@Override
+		public void handle(HttpExchange exchange) throws IOException {
+			addCorsHeaders(exchange);
+			if ("OPTIONS".equalsIgnoreCase(exchange.getRequestMethod())) {
+				exchange.sendResponseHeaders(204, -1);
+				exchange.close();
+				return;
+			}
+
+			if (!"GET".equalsIgnoreCase(exchange.getRequestMethod())) {
+				writeJson(exchange, 405, "{\"error\":\"Method not allowed\"}");
+				return;
+			}
+
+			Session session = getSession(exchange);
+			if (session == null) {
+				writeJson(exchange, 401, "{\"error\":\"Unauthorized\"}");
+				return;
+			}
+
+			try {
+				TaskManager.AuthUser user = taskManager.getAuthUserById(session.userId);
+				if (user == null) {
+					writeJson(exchange, 404, "{\"error\":\"User not found\"}");
+					return;
+				}
+				writeJson(exchange, 200, profilePayload(user.getUsername(), user.getRole(), user.getAvatarUrl(), user.getDisplayName()));
+			} catch (SQLException e) {
+				writeJson(exchange, 500, "{\"error\":\"Database error\"}");
+			}
+		}
+	}
+
+	private class ProfileHandler implements HttpHandler {
+		@Override
+		public void handle(HttpExchange exchange) throws IOException {
+			addCorsHeaders(exchange);
+			if ("OPTIONS".equalsIgnoreCase(exchange.getRequestMethod())) {
+				exchange.sendResponseHeaders(204, -1);
+				exchange.close();
+				return;
+			}
+
+			if (!"PATCH".equalsIgnoreCase(exchange.getRequestMethod())) {
+				writeJson(exchange, 405, "{\"error\":\"Method not allowed\"}");
+				return;
+			}
+
+			Session session = getSession(exchange);
+			if (session == null) {
+				writeJson(exchange, 401, "{\"error\":\"Unauthorized\"}");
+				return;
+			}
+
+			try {
+				String body = new String(exchange.getRequestBody().readAllBytes(), StandardCharsets.UTF_8);
+				String displayName = extractNullableString(body, "displayName");
+				if (displayName != null) {
+					displayName = displayName.trim();
+					if (displayName.isEmpty()) displayName = null;
+				}
+				if (displayName != null && displayName.length() > 60) {
+					writeJson(exchange, 400, "{\"error\":\"Nom trop long (60 chars max)\"}");
+					return;
+				}
+				taskManager.updateDisplayName(session.userId, displayName);
+				TaskManager.AuthUser refreshedUser = taskManager.getAuthUserById(session.userId);
+				if (refreshedUser == null) {
+					writeJson(exchange, 404, "{\"error\":\"User not found\"}");
+					return;
+				}
+				writeJson(exchange, 200, profilePayload(refreshedUser.getUsername(), refreshedUser.getRole(), refreshedUser.getAvatarUrl(), refreshedUser.getDisplayName()));
 			} catch (SQLException e) {
 				writeJson(exchange, 500, "{\"error\":\"Database error\"}");
 			}
@@ -414,6 +657,106 @@ public class TaskController {
 			} catch (SQLException e) {
 				writeJson(exchange, 500, "{\"error\":\"Database error\"}");
 			}
+		}
+	}
+
+	private class AdminUsersHandler implements HttpHandler {
+		@Override
+		public void handle(HttpExchange exchange) throws IOException {
+			addCorsHeaders(exchange);
+			String method = exchange.getRequestMethod();
+			if ("OPTIONS".equalsIgnoreCase(method)) {
+				exchange.sendResponseHeaders(204, -1);
+				exchange.close();
+				return;
+			}
+
+			Session session = getSession(exchange);
+			if (session == null) {
+				writeJson(exchange, 401, "{\"error\":\"Unauthorized\"}");
+				return;
+			}
+			if (!"ADMIN".equalsIgnoreCase(session.role)) {
+				writeJson(exchange, 403, "{\"error\":\"Forbidden\"}");
+				return;
+			}
+
+			String path = exchange.getRequestURI().getPath();
+
+			try {
+				if ("GET".equalsIgnoreCase(method) && "/api/admin/users".equals(path)) {
+					List<TaskManager.UserSummary> users = taskManager.listAllUsers();
+					writeJson(exchange, 200, adminUsersToJson(users));
+					return;
+				}
+
+				if ("DELETE".equalsIgnoreCase(method) && path.matches("^/api/admin/users/\\d+$")) {
+					int targetId = extractLastPathSegmentId(path);
+					if (targetId == session.userId) {
+						writeJson(exchange, 400, "{\"error\":\"Impossible de supprimer son propre compte\"}");
+						return;
+					}
+					boolean deleted = taskManager.deleteUser(targetId);
+					if (!deleted) {
+						writeJson(exchange, 404, "{\"error\":\"User not found\"}");
+						return;
+					}
+					writeJson(exchange, 200, "{\"deleted\":true}");
+					return;
+				}
+
+				if ("PATCH".equalsIgnoreCase(method) && path.matches("^/api/admin/users/\\d+/role$")) {
+					int targetId = extractLastPathSegmentId(path.replaceFirst("/role$", ""));
+					if (targetId == session.userId) {
+						writeJson(exchange, 400, "{\"error\":\"Impossible de modifier son propre role\"}");
+						return;
+					}
+					String body = new String(exchange.getRequestBody().readAllBytes(), StandardCharsets.UTF_8);
+					String role = extractString(body, "role");
+					if (role == null || (!role.equalsIgnoreCase("ADMIN") && !role.equalsIgnoreCase("USER"))) {
+						writeJson(exchange, 400, "{\"error\":\"Role invalide (USER ou ADMIN)\"}");
+						return;
+					}
+					boolean updated = taskManager.updateUserRole(targetId, role.toUpperCase());
+					if (!updated) {
+						writeJson(exchange, 404, "{\"error\":\"User not found\"}");
+						return;
+					}
+					writeJson(exchange, 200, "{\"updated\":true,\"role\":\"" + escapeJson(role.toUpperCase()) + "\"}");
+					return;
+				}
+
+				writeJson(exchange, 405, "{\"error\":\"Method not allowed\"}");
+			} catch (SQLException e) {
+				writeJson(exchange, 500, "{\"error\":\"Database error\"}");
+			}
+		}
+
+		private int extractLastPathSegmentId(String path) {
+			String[] parts = path.split("/");
+			return Integer.parseInt(parts[parts.length - 1]);
+		}
+
+		private String adminUsersToJson(List<TaskManager.UserSummary> users) {
+			StringBuilder builder = new StringBuilder("[");
+			for (int i = 0; i < users.size(); i++) {
+				TaskManager.UserSummary u = users.get(i);
+				String masked = isValidEmail(u.getUsername()) ? maskEmail(u.getUsername()) : null;
+				String dn = (u.getDisplayName() != null && !u.getDisplayName().isBlank())
+						? u.getDisplayName().trim()
+						: (isValidEmail(u.getUsername())
+							? u.getUsername().substring(0, u.getUsername().indexOf('@'))
+							: u.getUsername());
+				builder.append("{")
+						.append("\"id\":").append(u.getId()).append(",")
+						.append("\"maskedEmail\":").append(toJsonNullableString(masked)).append(",")
+						.append("\"displayName\":\"").append(escapeJson(dn)).append("\",")
+						.append("\"role\":\"").append(escapeJson(u.getRole() == null ? "USER" : u.getRole())).append("\"")
+						.append("}");
+				if (i < users.size() - 1) builder.append(",");
+			}
+			builder.append("]");
+			return builder.toString();
 		}
 	}
 
@@ -496,7 +839,12 @@ public class TaskController {
 	}
 
 	private void addCorsHeaders(HttpExchange exchange) {
-		exchange.getResponseHeaders().add("Access-Control-Allow-Origin", "http://localhost:5173");
+		String origin = exchange.getRequestHeaders().getFirst("Origin");
+		if (origin != null && origin.matches("http://localhost:\\d+")) {
+			exchange.getResponseHeaders().add("Access-Control-Allow-Origin", origin);
+		} else {
+			exchange.getResponseHeaders().add("Access-Control-Allow-Origin", "http://localhost:5173");
+		}
 		exchange.getResponseHeaders().add("Access-Control-Allow-Methods", "GET,POST,PUT,PATCH,DELETE,OPTIONS");
 		exchange.getResponseHeaders().add("Access-Control-Allow-Headers", "Content-Type, Authorization");
 	}
@@ -576,6 +924,81 @@ public class TaskController {
 			return "null";
 		}
 		return "\"" + escapeJson(value) + "\"";
+	}
+
+	private String authPayload(String token, String username, String role, String avatarUrl, String displayName) {
+		return "{" +
+				"\"token\":\"" + escapeJson(token) + "\"," +
+				profilePayloadFields(username, role, avatarUrl, displayName) +
+				"}";
+	}
+
+	private String profilePayload(String username, String role, String avatarUrl, String displayName) {
+		return "{" + profilePayloadFields(username, role, avatarUrl, displayName) + "}";
+	}
+
+	private String profilePayloadFields(String username, String role, String avatarUrl, String displayName) {
+		PublicIdentity identity = buildPublicIdentity(username, displayName);
+		return "\"username\":" + toJsonNullableString(username) + "," +
+				"\"role\":\"" + escapeJson(role == null ? "USER" : role) + "\"," +
+				"\"avatarUrl\":" + toJsonNullableString(avatarUrl) + "," +
+				"\"displayName\":\"" + escapeJson(identity.displayName) + "\"," +
+				"\"givenName\":" + toJsonNullableString(identity.givenName) + "," +
+				"\"familyName\":" + toJsonNullableString(identity.familyName) + "," +
+				"\"maskedEmail\":" + toJsonNullableString(identity.maskedEmail);
+	}
+
+	private PublicIdentity buildPublicIdentity(String username, String storedDisplayName) {
+		String safeUsername = username == null ? "" : username.trim();
+		if (safeUsername.isEmpty()) {
+			return new PublicIdentity("Utilisateur", null, null, null);
+		}
+
+		String maskedEmail = isValidEmail(safeUsername) ? maskEmail(safeUsername) : null;
+
+		if (storedDisplayName != null && !storedDisplayName.isBlank()) {
+			String stored = storedDisplayName.trim();
+			String[] parts = stored.split("\\s+", 2);
+			String givenName = parts.length > 0 && !parts[0].isBlank() ? parts[0] : null;
+			String familyName = parts.length > 1 && !parts[1].isBlank() ? parts[1] : null;
+			return new PublicIdentity(stored, givenName, familyName, maskedEmail);
+		}
+
+		if (!isValidEmail(safeUsername)) {
+			return new PublicIdentity(safeUsername, null, null, null);
+		}
+
+		String localPart = safeUsername.substring(0, safeUsername.indexOf('@'));
+		String[] tokens = localPart.split("[._\\-\\s]+");
+		String first = tokens.length > 0 ? normalizeToken(tokens[0]) : "";
+		String second = tokens.length > 1 ? normalizeToken(tokens[1]) : "";
+
+		String givenName = first.isEmpty() ? null : first;
+		String familyName = second.isEmpty() ? null : second;
+		String displayName;
+		if (givenName != null && familyName != null) {
+			displayName = givenName + " " + familyName;
+		} else if (givenName != null) {
+			displayName = givenName;
+		} else {
+			displayName = "Utilisateur";
+		}
+
+		return new PublicIdentity(displayName, givenName, familyName, maskedEmail);
+	}
+
+	private String normalizeToken(String token) {
+		if (token == null) {
+			return "";
+		}
+		String clean = token.trim();
+		if (clean.isEmpty()) {
+			return "";
+		}
+		if (clean.length() == 1) {
+			return clean.toUpperCase();
+		}
+		return clean.substring(0, 1).toUpperCase() + clean.substring(1).toLowerCase();
 	}
 
 	private Session getSession(HttpExchange exchange) {
@@ -663,6 +1086,11 @@ public class TaskController {
 	private void cleanupExpiredPendingLogins() {
 		long now = System.currentTimeMillis();
 		pendingLogins.entrySet().removeIf(entry -> entry.getValue().expiresAtMs < now);
+	}
+
+	private void cleanupExpiredPendingPasswordResets() {
+		long now = System.currentTimeMillis();
+		pendingPasswordResets.entrySet().removeIf(entry -> entry.getValue().expiresAtMs < now);
 	}
 
 	private boolean sendLoginCodeEmail(String toEmail, String code) {

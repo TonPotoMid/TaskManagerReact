@@ -20,12 +20,14 @@ public class DatabaseManager {
         private final String username;
         private final String role;
         private final String avatarUrl;
+        private final String displayName;
 
-        public AuthUser(int id, String username, String role, String avatarUrl) {
+        public AuthUser(int id, String username, String role, String avatarUrl, String displayName) {
             this.id = id;
             this.username = username;
             this.role = role;
             this.avatarUrl = avatarUrl;
+            this.displayName = displayName;
         }
 
         public int getId() {
@@ -42,6 +44,10 @@ public class DatabaseManager {
 
         public String getAvatarUrl() {
             return avatarUrl;
+        }
+
+        public String getDisplayName() {
+            return displayName;
         }
     }
 
@@ -278,7 +284,7 @@ public class DatabaseManager {
             }
         }
 
-        String insertSql = "INSERT INTO app_user (username, password, role) VALUES (?, ?, ?) RETURNING id, role, avatar_url";
+        String insertSql = "INSERT INTO app_user (username, password, role) VALUES (?, ?, ?) RETURNING id, role, avatar_url, display_name";
         try (Connection connection = openConnection();
              PreparedStatement insertStatement = connection.prepareStatement(insertSql)) {
             insertStatement.setString(1, username);
@@ -286,7 +292,7 @@ public class DatabaseManager {
             insertStatement.setString(3, "USER");
             try (ResultSet rs = insertStatement.executeQuery()) {
                 if (rs.next()) {
-                    return new AuthUser(rs.getInt("id"), username, rs.getString("role"), rs.getString("avatar_url"));
+                    return new AuthUser(rs.getInt("id"), username, rs.getString("role"), rs.getString("avatar_url"), rs.getString("display_name"));
                 }
             }
         }
@@ -297,7 +303,7 @@ public class DatabaseManager {
     public AuthUser authenticateUser(String username, String password) throws SQLException {
         ensureSecuritySchema();
 
-        String sql = "SELECT id, role, avatar_url FROM app_user WHERE username = ? AND password = ?";
+        String sql = "SELECT id, role, avatar_url, display_name FROM app_user WHERE username = ? AND password = ?";
         try (Connection connection = openConnection();
              PreparedStatement statement = connection.prepareStatement(sql)) {
             statement.setString(1, username);
@@ -305,12 +311,23 @@ public class DatabaseManager {
 
             try (ResultSet rs = statement.executeQuery()) {
                 if (rs.next()) {
-                    return new AuthUser(rs.getInt("id"), username, rs.getString("role"), rs.getString("avatar_url"));
+                    return new AuthUser(rs.getInt("id"), username, rs.getString("role"), rs.getString("avatar_url"), rs.getString("display_name"));
                 }
             }
         }
 
         return null;
+    }
+
+    public boolean updateUserDisplayName(int userId, String displayName) throws SQLException {
+        ensureSecuritySchema();
+        String sql = "UPDATE app_user SET display_name = ? WHERE id = ?";
+        try (Connection connection = openConnection();
+             PreparedStatement statement = connection.prepareStatement(sql)) {
+            statement.setString(1, displayName == null || displayName.isBlank() ? null : displayName.trim());
+            statement.setInt(2, userId);
+            return statement.executeUpdate() > 0;
+        }
     }
 
     public boolean updateUserAvatarUrl(int userId, String avatarUrl) throws SQLException {
@@ -332,18 +349,53 @@ public class DatabaseManager {
     public AuthUser loadAuthUserById(int userId) throws SQLException {
         ensureSecuritySchema();
 
-        String sql = "SELECT id, username, role, avatar_url FROM app_user WHERE id = ?";
+        String sql = "SELECT id, username, role, avatar_url, display_name FROM app_user WHERE id = ?";
         try (Connection connection = openConnection();
              PreparedStatement statement = connection.prepareStatement(sql)) {
             statement.setInt(1, userId);
             try (ResultSet rs = statement.executeQuery()) {
                 if (rs.next()) {
-                    return new AuthUser(rs.getInt("id"), rs.getString("username"), rs.getString("role"), rs.getString("avatar_url"));
+                    return new AuthUser(rs.getInt("id"), rs.getString("username"), rs.getString("role"), rs.getString("avatar_url"), rs.getString("display_name"));
                 }
             }
         }
 
         return null;
+    }
+
+    public AuthUser loadAuthUserByUsername(String username) throws SQLException {
+        ensureSecuritySchema();
+
+        String sql = "SELECT id, username, role, avatar_url, display_name FROM app_user WHERE username = ?";
+        try (Connection connection = openConnection();
+             PreparedStatement statement = connection.prepareStatement(sql)) {
+            statement.setString(1, username);
+            try (ResultSet rs = statement.executeQuery()) {
+                if (rs.next()) {
+                    return new AuthUser(
+                            rs.getInt("id"),
+                            rs.getString("username"),
+                            rs.getString("role"),
+                            rs.getString("avatar_url"),
+                            rs.getString("display_name")
+                    );
+                }
+            }
+        }
+
+        return null;
+    }
+
+    public boolean updateUserPassword(int userId, String newPassword) throws SQLException {
+        ensureSecuritySchema();
+
+        String sql = "UPDATE app_user SET password = ? WHERE id = ?";
+        try (Connection connection = openConnection();
+             PreparedStatement statement = connection.prepareStatement(sql)) {
+            statement.setString(1, newPassword);
+            statement.setInt(2, userId);
+            return statement.executeUpdate() > 0;
+        }
     }
 
     private void ensureCategoryColumn() throws SQLException {
@@ -457,12 +509,14 @@ public class DatabaseManager {
         String seedAdminSql = "INSERT INTO app_user (username, password, role) VALUES ('admin', 'admin123', 'ADMIN') ON CONFLICT (username) DO NOTHING";
         String seedUserSql = "INSERT INTO app_user (username, password, role) VALUES ('user', 'user123', 'USER') ON CONFLICT (username) DO NOTHING";
            String addAvatarSql = "ALTER TABLE app_user ADD COLUMN IF NOT EXISTS avatar_url VARCHAR(1000)";
+        String addDisplayNameSql = "ALTER TABLE app_user ADD COLUMN IF NOT EXISTS display_name VARCHAR(120)";
 
         try (Connection connection = openConnection();
              PreparedStatement createUserStatement = connection.prepareStatement(createUserSql);
              PreparedStatement seedAdminStatement = connection.prepareStatement(seedAdminSql);
              PreparedStatement seedUserStatement = connection.prepareStatement(seedUserSql);
                PreparedStatement addAvatarStatement = connection.prepareStatement(addAvatarSql);
+             PreparedStatement addDisplayNameStatement = connection.prepareStatement(addDisplayNameSql);
              PreparedStatement addOwnerStatement = connection.prepareStatement(addOwnerSql);
              PreparedStatement backfillStatement = connection.prepareStatement(backfillSql);
              PreparedStatement setNotNullStatement = connection.prepareStatement(setNotNullSql)) {
@@ -470,6 +524,7 @@ public class DatabaseManager {
             seedAdminStatement.execute();
             seedUserStatement.execute();
               addAvatarStatement.execute();
+            addDisplayNameStatement.execute();
             addOwnerStatement.execute();
             backfillStatement.execute();
             try {
@@ -544,5 +599,65 @@ public class DatabaseManager {
         }
 
         return defaultValue;
+    }
+
+    public static class UserSummary {
+        private final int id;
+        private final String username;
+        private final String role;
+        private final String displayName;
+
+        public UserSummary(int id, String username, String role, String displayName) {
+            this.id = id;
+            this.username = username;
+            this.role = role;
+            this.displayName = displayName;
+        }
+
+        public int getId() { return id; }
+        public String getUsername() { return username; }
+        public String getRole() { return role; }
+        public String getDisplayName() { return displayName; }
+    }
+
+    public List<UserSummary> listAllUsers() throws SQLException {
+        ensureSecuritySchema();
+        String sql = "SELECT id, username, role, display_name FROM app_user ORDER BY id";
+        List<UserSummary> users = new ArrayList<>();
+        try (Connection connection = openConnection();
+             PreparedStatement statement = connection.prepareStatement(sql)) {
+            try (ResultSet rs = statement.executeQuery()) {
+                while (rs.next()) {
+                    users.add(new UserSummary(
+                            rs.getInt("id"),
+                            rs.getString("username"),
+                            rs.getString("role"),
+                            rs.getString("display_name")
+                    ));
+                }
+            }
+        }
+        return users;
+    }
+
+    public boolean deleteUserById(int userId) throws SQLException {
+        ensureSecuritySchema();
+        String sql = "DELETE FROM app_user WHERE id = ?";
+        try (Connection connection = openConnection();
+             PreparedStatement statement = connection.prepareStatement(sql)) {
+            statement.setInt(1, userId);
+            return statement.executeUpdate() > 0;
+        }
+    }
+
+    public boolean updateUserRole(int userId, String role) throws SQLException {
+        ensureSecuritySchema();
+        String sql = "UPDATE app_user SET role = ? WHERE id = ?";
+        try (Connection connection = openConnection();
+             PreparedStatement statement = connection.prepareStatement(sql)) {
+            statement.setString(1, role);
+            statement.setInt(2, userId);
+            return statement.executeUpdate() > 0;
+        }
     }
 }
